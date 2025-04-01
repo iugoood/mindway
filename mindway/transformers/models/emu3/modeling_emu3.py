@@ -23,11 +23,9 @@
 """ MindSpore Emu3 model."""
 import math
 from functools import cached_property
-import warnings
 from typing import List, Optional, Tuple, Union
 
-from emu3.acceleration import GatherFowardSplitBackward, SplitFowardGatherBackward, get_sequence_parallel_group
-from emu3.mllm.configuration_emu3 import Emu3Config
+from transformers import Emu3Config, Emu3TextConfig, Emu3VQVAEConfig
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -36,13 +34,15 @@ from transformers.utils import (
 )
 
 import mindspore as ms
-from mindspore import mint, nn, ops
-from mindspore.common.initializer import Normal, initializer
+from mindspore import mint, nn, ops, jit_class, _no_grad
+from mindspore.common.initializer import Constant, HeNormal, Normal, Uniform, initializer
 from mindspore.communication import get_group_size
 
 from mindway.transformers.activations import ACT2FN
-from mindway.transformers.cache_utils import Cache, DynamicCache  # , get_max_length, get_seq_length, update
+from mindway.transformers.cache_utils import Cache, DynamicCache, get_max_length, get_seq_length, update
 from mindway.transformers.mindspore_utils import ALL_LAYERNORM_LAYERS
+from mindway.transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
 from mindway.transformers.modeling_attn_mask_utils import (
     _MIN_FP16,
     AttentionMaskConverter,
@@ -53,21 +53,38 @@ from mindway.transformers.modeling_outputs import (  # SequenceClassifierOutputW
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from mindway.transformers.modeling_utils import MSPreTrainedModel
+from mindway.transformers.modeling_utils import MSPreTrainedModel, GenerationMixin
 
 logger = logging.get_logger(__name__)
 
 from mindway.transformers.utils import is_flash_attn_2_available  # Ascend
-from mindone.utils.version_control import check_valid_flash_attention
+from mindway.utils.version_control import check_valid_flash_attention
 
 FLASH_IS_AVAILABLE = is_flash_attn_2_available and check_valid_flash_attention()
 if FLASH_IS_AVAILABLE:
     from mindspore.ops.operations.nn_ops import FlashAttentionScore as MSFlashAttention
-
+from mindway.transformers.mindspore_adapter import scaled_dot_product_attention, dtype_to_min
 from mindspore.nn import CrossEntropyLoss  # BCEWithLogitsLoss, MSELoss
 
 _CONFIG_FOR_DOC = "Emu3Config"
 
+@jit_class
+class no_grad(_no_grad):
+    """
+    A context manager that suppresses gradient memory allocation in PyNative mode.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._pynative = ms.get_context("mode") == ms.PYNATIVE_MODE
+
+    def __enter__(self):
+        if self._pynative:
+            super().__enter__()
+
+    def __exit__(self, *args):
+        if self._pynative:
+            super().__exit__(*args)
 class Emu3RMSNorm(nn.Cell):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -163,7 +180,7 @@ def eager_attention_construct(
     dropout: float = 0.0,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = mint.matmul(query, key_states.swapaxes(2, 3)) * scaling
 
@@ -186,7 +203,7 @@ ALL_ATTENTION_FUNCTIONS = {
 class Emu3Attention(nn.Cell):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Emu3Config, layer_idx: int):
+    def __init__(self, config: Emu3TextConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -204,15 +221,15 @@ class Emu3Attention(nn.Cell):
         self.q_proj = mint.nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = mint.nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = mint.nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = mint.nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.o_proj = mint.nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
 
         # Initialize sequence parallel operator
-        if (sp_group := get_sequence_parallel_group()) is not None:
-            self.sp_group_size = get_group_size(sp_group)
-            self.alltoall = ops.AlltoAll(self.sp_group_size, 1, 2, group=sp_group)
-        else:
-            self.sp_group_size = None
-            self.alltoall = nn.Identity()
+        # if (sp_group := get_sequence_parallel_group()) is not None:
+        #     self.sp_group_size = get_group_size(sp_group)
+        #     self.alltoall = ops.AlltoAll(self.sp_group_size, 1, 2, group=sp_group)
+        # else:
+        self.sp_group_size = None
+        self.alltoall = nn.Identity()
 
         if self.config._attn_implementation == "sdpa":
             self.config._attn_implementation == "eager"
@@ -313,7 +330,7 @@ class Emu3Attention(nn.Cell):
         # sequence parallel: gather BSN'D => BS'ND
         attn_output = self.alltoall(attn_output.float()).to(target_dtype)
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.config.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
@@ -336,7 +353,7 @@ class Emu3Attention(nn.Cell):
         return attention_mask
 
 class Emu3DecoderLayer(nn.Cell):
-    def __init__(self, config: Emu3Config, layer_idx: int):
+    def __init__(self, config: Emu3TextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -419,11 +436,11 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
     def __init__(self, config: Emu3VQVAEConfig):
         super().__init__()
         self.embedding = mint.nn.Embedding(config.codebook_size, config.embed_dim)
-        self.embedding.embedding_table.set_data(
+        self.embedding.weight.set_data(
             initializer(
                 Uniform(scale=1.0 / config.codebook_size),
-                self.embedding.embedding_table.shape,
-                self.embedding.embedding_table.dtype,
+                self.embedding.weight.shape,
+                self.embedding.weight.dtype,
             )
         )
 
@@ -435,10 +452,10 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         hidden_state_sum = ops.sum(hidden_state_flattened**2, dim=1, keepdim=True)
-        embedding_sum = ops.sum(self.embedding.embedding_table**2, dim=1)
+        embedding_sum = ops.sum(self.embedding.weight**2, dim=1)
 
         # "bd,dn->bn"
-        distances = 2 * ops.matmul(hidden_state_flattened, self.embedding.embedding_table.permute(0, 1))
+        distances = 2 * ops.matmul(hidden_state_flattened, self.embedding.weight.permute(0, 1))
         distances = hidden_state_sum + embedding_sum - distances
 
         min_encoding_indices = ops.argmin(distances, axis=1)
@@ -466,7 +483,7 @@ class Emu3VQVAEEncoderConvUpsample(nn.Cell):
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
-class Emu3VisionVQCausalConv3d(nn.Cell):
+class Emu3VQVAEConv3d(nn.Cell):
     def __init__(
         self,
         in_channel: int,
@@ -489,7 +506,7 @@ class Emu3VisionVQCausalConv3d(nn.Cell):
             stride=stride,
         ).to_float(conv3d_dtype)
 
-    def forward(self, hidden_states: ms.Tensor):
+    def construct(self, hidden_states: ms.Tensor):
         origin_dtype = hidden_states.dtype
         hidden_states = mint.nn.functional.pad(hidden_states, self.padding)
         hidden_states = self.conv(hidden_states)
@@ -768,7 +785,7 @@ class Emu3VQVAEGroupNorm(mint.nn.GroupNorm):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    def forward(self, input, quant_states=None):
+    def construct(self, input, quant_states=None):
         return mint.nn.functional.group_norm(input, self.num_groups, self.weight, self.bias, self.eps)
 
 
@@ -793,7 +810,7 @@ class Emu3VQVAEMiddleBlock(nn.Cell):
             quant_channels=quant_channels,
         )
 
-    def forward(self, hidden_states: ms.Tensor, quant_states: ms.Tensor = None):
+    def construct(self, hidden_states: ms.Tensor, quant_states: ms.Tensor = None):
         hidden_states = self.block_1(hidden_states, quant_states)
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states, quant_states)
@@ -923,8 +940,8 @@ class Emu3VQVAEUpBlock(nn.Cell):
         return hidden_states
 
 
-class Emu3VisionVQEncoder(nn.Cell):
-    def __init__(self, config: Emu3VisionVQConfig):
+class Emu3VQVAEEncoder(nn.Cell):
+    def __init__(self, config: Emu3VQVAEConfig):
         super().__init__()
         base_channels = config.base_channels
         in_channels = config.in_channels
@@ -1086,6 +1103,26 @@ EMU3_VQ_START_DOCSTRING = r"""
     """,
     EMU3_VQ_START_DOCSTRING,
 )
+def _calculate_fan_in_and_fan_out(arr):
+    # calculate fan_in and fan_out. fan_in is the number of input units in `arr` , and fan_out is the number of output units in `arr`.
+    shape = arr.shape
+    dimensions = len(shape)
+    if dimensions < 2:
+        raise ValueError("'fan_in' and 'fan_out' can not be computed for arr with fewer than"
+                         " 2 dimensions, but got dimensions {}.".format(dimensions))
+    if dimensions == 2:  # Linear
+        fan_in = shape[1]
+        fan_out = shape[0]
+    else:
+        num_input_fmaps = shape[1]
+        num_output_fmaps = shape[0]
+        receptive_field_size = 1
+        for i in range(2, dimensions):
+            receptive_field_size *= shape[i]
+        fan_in = num_input_fmaps * receptive_field_size
+        fan_out = num_output_fmaps * receptive_field_size
+    return fan_in, fan_out
+
 class Emu3VQVAE(MSPreTrainedModel):
     config_class = Emu3VQVAEConfig
     base_model_prefix = "emuvideovq"
@@ -1106,18 +1143,18 @@ class Emu3VQVAE(MSPreTrainedModel):
             weight = initializer(HeNormal(negative_slope=math.sqrt(5)), module.weight.shape, module.weight.dtype)
             module.weight.set_data(weight)
             if module.bias is not None:
-                fan_in, _ = initializer._calculate_fan_in_and_fan_out(module.weight.shape)
+                fan_in, _ = _calculate_fan_in_and_fan_out(module.weight)
                 bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
                 bias_weight = initializer(
-                    Uniform(scale=bound), module.embedding_table.shape, module.embedding_table.dtype
+                    Uniform(scale=bound), module.weight.shape, module.weight.dtype
                 )
                 module.bias.set_data(bias_weight)
         elif isinstance(module, (mint.nn.BatchNorm2d, mint.nn.GroupNorm)):
-            module.gamma.set_data(initializer(Constant(1), module.gamma.shape, module.gamma.dtype))
-            module.beta.set_data(initializer(Constant(0), module.beta.shape, module.beta.dtype))
-        elif isinstance(module, mint.nn.BatchNorm3d): # TODO: test if correct
-            module.bn2d.gamma.set_data(initializer(Constant(1), module.bn2d.gamma.shape, module.bn2d.gamma.dtype))
-            module.bn2d.beta.set_data(initializer(Constant(0), module.bn2d.beta.shape, module.bn2d.beta.dtype))
+            module.weight.set_data(initializer(Constant(1), module.weight.shape, module.weight.dtype))
+            module.bias.set_data(initializer(Constant(0), module.bias.shape, module.bias.dtype))
+        elif isinstance(module, mint.nn.BatchNorm3d):
+            module.weight.set_data(initializer(Constant(1), module.weight.shape, module.weight.dtype))
+            module.bias.set_data(initializer(Constant(0), module.bias.shape, module.bias.dtype))
 
     def __init__(self, config: Emu3VQVAEConfig):
         super().__init__(config)
@@ -1177,7 +1214,7 @@ class Emu3VQVAE(MSPreTrainedModel):
         quant = self.quantize.embedding(hidden_states.flatten(start_dim=0))
 
         channels = quant.shape[-1]
-        quant = quant.view((b, t, h, w, c)).permute(0, 4, 1, 2, 3).contiguous()
+        quant = quant.view((batch_size, temporal, height, width, channels)).permute(0, 4, 1, 2, 3).contiguous()
         post_quant = self.post_quant_conv(quant)
 
         quant = quant.permute(0, 2, 1, 3, 4)
@@ -1283,17 +1320,17 @@ class Emu3PreTrainedModel(MSPreTrainedModel):
     _supports_flex_attn = False
 
     def _init_weights(self, module):
-        std = self.config.initializer_range
+        std = self.config.get_text_config().initializer_range
         if isinstance(module, mint.nn.Linear):
             module.weight.set_data(initializer(Normal(sigma=std, mean=0.0), module.weight.shape, module.weight.dtype))
             if module.bias is not None:
                 module.bias.set_data(initializer("zeros", module.bias.shape, module.bias.dtype))
         elif isinstance(module, mint.nn.Embedding):
-            module.embedding_table.set_data(
-                initializer(Normal(sigma=std, mean=0.0), module.embedding_table.shape, module.embedding_table.dtype)
+            module.weight.set_data(
+                initializer(Normal(sigma=std, mean=0.0), module.weight.shape, module.weight.dtype)
             )
             if module.padding_idx is not None:
-                module.embedding_table[module.padding_idx] = 0
+                module.weight[module.padding_idx] = 0
 
 class Emu3RotaryEmbedding(nn.Cell):
     def __init__(self, config: Emu3Config):
@@ -1325,24 +1362,24 @@ class Emu3RotaryEmbedding(nn.Cell):
             self.inv_freq = self.original_inv_freq
             self.max_seq_len_cached = self.original_max_seq_len
 
-    @no_grad():
     def construct(self, x, position_ids):
-        if "dynamic" in self.rope_type: # not used
-            self._dynamic_frequency_update(position_ids)
+        with no_grad():
+            if "dynamic" in self.rope_type: # not used
+                self._dynamic_frequency_update(position_ids)
 
-        # Core RoPE block
-        inv_freq_expanded = self.inv_freq[None, :, None].float().broadcast_to((position_ids.shape[0], -1, 1))
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).swapaxes(1, 2)
-        emb = mint.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
-         # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
+            # Core RoPE block
+            inv_freq_expanded = self.inv_freq[None, :, None].float().broadcast_to((position_ids.shape[0], -1, 1))
+            position_ids_expanded = position_ids[:, None, :].float()
+            # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).swapaxes(1, 2)
+            emb = mint.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+            # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+            cos = cos * self.attention_scaling
+            sin = sin * self.attention_scaling
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+            return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 EMU3_TEXT_INPUTS_DOCSTRING = r"""
@@ -1431,7 +1468,7 @@ class Emu3TextModel(Emu3PreTrainedModel):
         config: Emu3TextConfig
     """
 
-    def __init__(self, config: Emu3Config):
+    def __init__(self, config: Emu3TextConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1446,13 +1483,13 @@ class Emu3TextModel(Emu3PreTrainedModel):
         self.gradient_checkpointing = False
 
         # Initialize sequence parallel
-        if (sp_group := get_sequence_parallel_group()) is not None:
-            logger.info(f"Initialize Emu3 model with sequence parallel group `{sp_group}`.")
-            self.split_forward_gather_backward = SplitFowardGatherBackward(dim=1, grad_scale="down", group=sp_group)
-            self.gather_forward_split_backward = GatherFowardSplitBackward(dim=1, grad_scale="up", group=sp_group)
-        else:
-            self.split_forward_gather_backward = nn.Identity()
-            self.gather_forward_split_backward = nn.Identity()
+        # if (sp_group := get_sequence_parallel_group()) is not None:
+        #     logger.info(f"Initialize Emu3 model with sequence parallel group `{sp_group}`.")
+        #     self.split_forward_gather_backward = SplitFowardGatherBackward(dim=1, grad_scale="down", group=sp_group)
+        #     self.gather_forward_split_backward = GatherFowardSplitBackward(dim=1, grad_scale="up", group=sp_group)
+        # else:
+        self.split_forward_gather_backward = nn.Identity()
+        self.gather_forward_split_backward = nn.Identity()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1812,7 +1849,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
+    '''
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1900,6 +1937,7 @@ class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
             }
         )
         return model_inputs
+    '''
 
     @staticmethod
     def _reorder_cache(past_key_values, beam_idx):
@@ -1995,7 +2033,7 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.text_model = Emu3ForCausalLM._from_config(config.text_config)
+        self.text_model = Emu3ForCausalLM(config.text_config)
         self.vqmodel = Emu3VQVAE(config.vq_config)
         self.vocabulary_mapping = Emu3ImageVocabularyMapping(config.vocabulary_map)
 
@@ -2025,7 +2063,6 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
         bpe_tokens = mint.cat(bpe_tokens_list)
         return bpe_tokens
 
-    @no_grad
     def decode_image_tokens(self, image_tokens: ms.Tensor, height: int, width: int):
         """
         Decodes generated image tokens from language model to continuous pixel values
@@ -2039,14 +2076,15 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
             width (`int`):
                 Width of the generated image before upsampling.
         """
-        sequences = image_tokens[:, :-3].view(-1, height, width + 1)
-        image_tokens = self.vocabulary_mapping.convert_bpe2img(sequences)
-        image = self.vqmodel.decode(image_tokens)
-        return image
+        with no_grad():
+            sequences = image_tokens[:, :-3].view(-1, height, width + 1)
+            image_tokens = self.vocabulary_mapping.convert_bpe2img(sequences)
+            image = self.vqmodel.decode(image_tokens)
+            return image
 
     @add_start_docstrings_to_model_forward(EMU3_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
-    def forward(
+    def construct(
         self,
         input_ids: ms.Tensor = None,
         pixel_values: ms.Tensor = None,

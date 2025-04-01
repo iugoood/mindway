@@ -6,6 +6,7 @@ from . import (
     clap,
     clip,
     dpt,
+    emu3,
     gemma,
     gemma2,
     glm,

@@ -53,6 +53,11 @@ from .models.gemma import (
     GemmaModel,
     GemmaPreTrainedModel,
 )
+from .models.emu3 import (
+    Emu3VQVAE,
+    Emu3ForCausalLM,
+    Emu3ForConditionalGeneration
+)
 from .models.gemma2 import Gemma2Model, Gemma2PreTrainedModel
 from .models.glm import (
     GlmForCausalLM,
