@@ -35,38 +35,46 @@ from transformers.utils import (
 
 import mindspore as ms
 from mindspore import mint, nn, ops, jit_class, _no_grad
-from mindspore.common.initializer import Constant, HeNormal, Normal, Uniform, initializer
+from mindspore.common.initializer import (
+    Constant,
+    HeNormal,
+    Normal,
+    Uniform,
+    initializer,
+)
 from mindspore.communication import get_group_size
 
-from mindway.transformers.activations import ACT2FN
-from mindway.transformers.cache_utils import Cache, DynamicCache, get_max_length, get_seq_length, update
-from mindway.transformers.mindspore_utils import ALL_LAYERNORM_LAYERS
-from mindway.transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-
-from mindway.transformers.modeling_attn_mask_utils import (
-    _MIN_FP16,
-    AttentionMaskConverter,
-    _prepare_4d_attention_mask,
-    _prepare_4d_causal_attention_mask,
+from ...activations import ACT2FN
+from ...cache_utils import (
+    Cache,
+    DynamicCache,
+    get_max_length,
+    get_seq_length,
+    update,
 )
-from mindway.transformers.modeling_outputs import (  # SequenceClassifierOutputWithPast,
+from ...mindspore_utils import ALL_LAYERNORM_LAYERS
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from ...modeling_attn_mask_utils import _MIN_FP16
+from ...modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from mindway.transformers.modeling_utils import MSPreTrainedModel, GenerationMixin
-
-logger = logging.get_logger(__name__)
-
-from mindway.transformers.utils import is_flash_attn_2_available  # Ascend
-from mindway.utils.version_control import check_valid_flash_attention
+from ...modeling_utils import MSPreTrainedModel
+from ...generation import GenerationMixin
+from ...utils import is_flash_attn_2_available  # Ascend
+from ....utils.version_control import check_valid_flash_attention
 
 FLASH_IS_AVAILABLE = is_flash_attn_2_available and check_valid_flash_attention()
 if FLASH_IS_AVAILABLE:
     from mindspore.ops.operations.nn_ops import FlashAttentionScore as MSFlashAttention
-from mindway.transformers.mindspore_adapter import scaled_dot_product_attention, dtype_to_min
-from mindspore.nn import CrossEntropyLoss  # BCEWithLogitsLoss, MSELoss
+from ...mindspore_adapter import scaled_dot_product_attention
+
+from mindspore.nn import CrossEntropyLoss
+
+logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "Emu3Config"
+
 
 @jit_class
 class no_grad(_no_grad):
@@ -85,6 +93,8 @@ class no_grad(_no_grad):
     def __exit__(self, *args):
         if self._pynative:
             super().__exit__(*args)
+
+
 class Emu3RMSNorm(nn.Cell):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -98,11 +108,14 @@ class Emu3RMSNorm(nn.Cell):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(ms.float32)
         variance = hidden_states.pow(2).mean(-1, keep_dims=True)
-        hidden_states = hidden_states * ops.rsqrt(variance + self.variance_epsilon) * self.weight
+        hidden_states = (
+            hidden_states * ops.rsqrt(variance + self.variance_epsilon) * self.weight
+        )
         return hidden_states.to(input_dtype)
 
 
 ALL_LAYERNORM_LAYERS.append(Emu3RMSNorm)
+
 
 class Emu3MLP(nn.Cell):
     def __init__(self, config):
@@ -110,16 +123,21 @@ class Emu3MLP(nn.Cell):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = mint.nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = mint.nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = mint.nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = mint.nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.up_proj = mint.nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = mint.nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=config.mlp_bias
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def construct(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
-
 
 
 def rotate_half(x):
@@ -156,9 +174,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-
-
-
 def repeat_kv(hidden_states: ms.Tensor, n_rep: int) -> ms.Tensor:
     """
     This is the equivalent of ops.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -167,8 +182,11 @@ def repeat_kv(hidden_states: ms.Tensor, n_rep: int) -> ms.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].broadcast_to((batch, num_key_value_heads, n_rep, slen, head_dim))
+    hidden_states = hidden_states[:, :, None, :, :].broadcast_to(
+        (batch, num_key_value_heads, n_rep, slen, head_dim)
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
 
 def eager_attention_construct(
     module: nn.Cell,
@@ -189,17 +207,24 @@ def eager_attention_construct(
         attn_weights = attn_weights + causal_mask
 
     # upcast attention to fp32
-    attn_weights = mint.nn.functional.softmax(attn_weights, dim=-1, dtype=ms.float32).to(query.dtype)
-    attn_weights = mint.nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = mint.nn.functional.softmax(
+        attn_weights, dim=-1, dtype=ms.float32
+    ).to(query.dtype)
+    attn_weights = mint.nn.functional.dropout(
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = mint.matmul(attn_weights, value_states)
     attn_output = attn_output.swapaxes(1, 2).contiguous()  # BN'SD => BSN'D
 
     return attn_output, attn_weights
 
+
 ALL_ATTENTION_FUNCTIONS = {
     "eager": eager_attention_construct,
     "sdpa": scaled_dot_product_attention,
 }
+
+
 class Emu3Attention(nn.Cell):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -209,19 +234,39 @@ class Emu3Attention(nn.Cell):
         self.layer_idx = layer_idx
         # self.hidden_size = config.hidden_size  # 4096
         self.num_heads = config.num_attention_heads  # 32
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)  # 4096 / 32 = 128
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // self.num_heads
+        )  # 4096 / 32 = 128
         self.num_key_value_heads = config.num_key_value_heads  # 8
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads  # 32 / 8 = 4
+        self.num_key_value_groups = (
+            self.num_heads // self.num_key_value_heads
+        )  # 32 / 8 = 4
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         # self.max_position_embeddings = config.max_position_embeddings  # 9216
         # self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        self.q_proj = mint.nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = mint.nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = mint.nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = mint.nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.q_proj = mint.nn.Linear(
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.k_proj = mint.nn.Linear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = mint.nn.Linear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.o_proj = mint.nn.Linear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
 
         # Initialize sequence parallel operator
         # if (sp_group := get_sequence_parallel_group()) is not None:
@@ -231,16 +276,20 @@ class Emu3Attention(nn.Cell):
         self.sp_group_size = None
         self.alltoall = nn.Identity()
 
-        if self.config._attn_implementation == "sdpa":
-            self.config._attn_implementation == "eager"
+        if self.config._attn_implementation == "sdpa": # NOT supported
+            self.config._attn_implementation = "eager"
         # Flash Attention
-        if self.config._attn_implementation ==  "flash_attention_2":
+        if self.config._attn_implementation == "flash_attention_2":
             self.enable_flash_attention = FLASH_IS_AVAILABLE
             self.fa_dtype = ms.float16
-            if self.enable_flash_attention: #TODO change to adapter
+            if self.enable_flash_attention:  # TODO change to adapter
                 dropout_rate = self.attention_dropout if self.training else 0.0
                 # sequence parallel
-                num_heads = self.num_heads // self.sp_group_size if self.sp_group_size is not None else self.num_heads
+                num_heads = (
+                    self.num_heads // self.sp_group_size
+                    if self.sp_group_size is not None
+                    else self.num_heads
+                )
                 # Q: (b s n d) -> (b n s d)  #  b - batch_size, s - seq_len, n - num_head, d - head dim
                 self.flash_attention = MSFlashAttention(
                     scale_value=self.scaling,
@@ -249,9 +298,7 @@ class Emu3Attention(nn.Cell):
                     input_layout="BNSD",  # BSH or BNSD
                 )
             else:
-                self.config._attn_implementation == "eager"
-
-
+                self.config._attn_implementation = "eager"
 
     def construct(
         self,
@@ -268,9 +315,15 @@ class Emu3Attention(nn.Cell):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-        query_states = query_states.view((bsz, q_len, self.num_heads, self.head_dim)).swapaxes(1, 2)
-        key_states = key_states.view((bsz, q_len, self.num_key_value_heads, self.head_dim)).swapaxes(1, 2)
-        value_states = value_states.view((bsz, q_len, self.num_key_value_heads, self.head_dim)).swapaxes(1, 2)
+        query_states = query_states.view(
+            (bsz, q_len, self.num_heads, self.head_dim)
+        ).swapaxes(1, 2)
+        key_states = key_states.view(
+            (bsz, q_len, self.num_key_value_heads, self.head_dim)
+        ).swapaxes(1, 2)
+        value_states = value_states.view(
+            (bsz, q_len, self.num_key_value_heads, self.head_dim)
+        ).swapaxes(1, 2)
 
         # sequence parallel: scatter BNS'D => BN'SD
         query_states = self.alltoall(query_states.float()).to(target_dtype)
@@ -278,19 +331,25 @@ class Emu3Attention(nn.Cell):
         value_states = self.alltoall(value_states.float()).to(target_dtype)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         # Attention: BN'SD => BSN'D
         attn_weights = None
-        if self.config._attn_implementation ==  "flash_attention_2":
+        if self.config._attn_implementation == "flash_attention_2":
             attention_interface = self.flash_attention
         else:
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation
+            ]
         if self.config._attn_implementation == "eager":
             attn_output, attn_weights = attention_interface(
                 self,
@@ -309,9 +368,9 @@ class Emu3Attention(nn.Cell):
                 attention_mask,
                 dtype=ms.float16
                 # dropout=0.0 if not self.training else self.attention_dropout, # NOT yet support
-                # scaling=self.scaling,
+                # scaling=self.scaling,  # NOT yet support
             )
-        else: # flash attention
+        else:  # flash attention
             # NOTE: MSFlashAttention needs shape of BNSD ==> [batch_size,  num_heads, sequence_length, head_dim].
             if attention_mask is not None:
                 attention_mask = self.convert_mask_to_fa_format(attention_mask)
@@ -325,7 +384,8 @@ class Emu3Attention(nn.Cell):
                 attention_mask,
             )[3]
             attn_output = attn_output.to(target_dtype)
-            attn_output = attn_output.swapaxes(1, 2)  # b h n d -> b n h d (bsz, q_len, num_heads, head_dim)
+            attn_output = attn_output.swapaxes(1, 2)
+            # b h n d -> b n h d (bsz, q_len, num_heads, head_dim)
 
         # sequence parallel: gather BSN'D => BS'ND
         attn_output = self.alltoall(attn_output.float()).to(target_dtype)
@@ -352,6 +412,7 @@ class Emu3Attention(nn.Cell):
 
         return attention_mask
 
+
 class Emu3DecoderLayer(nn.Cell):
     def __init__(self, config: Emu3TextConfig, layer_idx: int):
         super().__init__()
@@ -361,7 +422,9 @@ class Emu3DecoderLayer(nn.Cell):
 
         self.mlp = Emu3MLP(config)
         self.input_layernorm = Emu3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Emu3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Emu3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.dropout = mint.nn.Dropout(p=config.attention_dropout)
 
     def construct(
@@ -401,8 +464,6 @@ class Emu3DecoderLayer(nn.Cell):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
@@ -433,6 +494,7 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
     Current implementation improves over previous ones by avoiding costly matrix multiplications
     and allowing for post-hoc remapping of indices.
     """
+
     def __init__(self, config: Emu3VQVAEConfig):
         super().__init__()
         self.embedding = mint.nn.Embedding(config.codebook_size, config.embed_dim)
@@ -447,7 +509,9 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
     def construct(self, hidden_state: ms.Tensor):
         # b t c h w -> b t h w c
         batch_size, temporal, channels, height, width = hidden_state.shape
-        hidden_state = hidden_state.permute(0, 1, 3, 4, 2).contiguous()  # (b, t, h, w, c)
+        hidden_state = hidden_state.permute(
+            0, 1, 3, 4, 2
+        ).contiguous()  # (b, t, h, w, c)
         hidden_state_flattened = hidden_state.view(-1, channels)
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
@@ -455,20 +519,29 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
         embedding_sum = ops.sum(self.embedding.weight**2, dim=1)
 
         # "bd,dn->bn"
-        distances = 2 * ops.matmul(hidden_state_flattened, self.embedding.weight.permute(0, 1))
+        distances = 2 * ops.matmul(
+            hidden_state_flattened, self.embedding.weight.permute(0, 1)
+        )
         distances = hidden_state_sum + embedding_sum - distances
 
         min_encoding_indices = ops.argmin(distances, axis=1)
-        min_encoding_indices = min_encoding_indices.view(batch_size, temporal, height, width)
+        min_encoding_indices = min_encoding_indices.view(
+            batch_size, temporal, height, width
+        )
         return min_encoding_indices
+
 
 class Emu3VQVAEEncoderConvDownsample(nn.Cell):
     def __init__(self, in_channels):
         super().__init__()
-        self.conv = mint.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+        self.conv = mint.nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, stride=2, padding=0
+        )
 
     def construct(self, hidden_states):
-        hidden_states = mint.nn.functional.pad(hidden_states, pad=(0, 1, 0, 1), mode="constant", value=0)
+        hidden_states = mint.nn.functional.pad(
+            hidden_states, pad=(0, 1, 0, 1), mode="constant", value=0
+        )
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
@@ -476,12 +549,17 @@ class Emu3VQVAEEncoderConvDownsample(nn.Cell):
 class Emu3VQVAEEncoderConvUpsample(nn.Cell):
     def __init__(self, in_channels):
         super().__init__()
-        self.conv = mint.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.conv = mint.nn.Conv2d(
+            in_channels, in_channels, kernel_size=3, stride=1, padding=1
+        )
 
     def construct(self, hidden_states):
-        hidden_states = mint.nn.functional.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
+        hidden_states = mint.nn.functional.interpolate(
+            hidden_states, scale_factor=2.0, mode="nearest"
+        )
         hidden_states = self.conv(hidden_states)
         return hidden_states
+
 
 class Emu3VQVAEConv3d(nn.Cell):
     def __init__(
@@ -490,10 +568,13 @@ class Emu3VQVAEConv3d(nn.Cell):
         out_channel: int,
         kernel_size: Tuple[int],
         stride: Tuple[int],
-        conv3d_dtype=ms.float16,
+        conv3d_dtype=ms.bfloat16,
     ):
         super().__init__()
-        padding_sizes = [one_kernel - one_stride for one_kernel, one_stride in zip(kernel_size[1:], stride[1:])]
+        padding_sizes = [
+            one_kernel - one_stride
+            for one_kernel, one_stride in zip(kernel_size[1:], stride[1:])
+        ]
         self.padding = ()
         for pad_size in padding_sizes[::-1]:
             self.padding += (pad_size // 2 + pad_size % 2, pad_size // 2)
@@ -511,6 +592,7 @@ class Emu3VQVAEConv3d(nn.Cell):
         hidden_states = mint.nn.functional.pad(hidden_states, self.padding)
         hidden_states = self.conv(hidden_states)
         return hidden_states.to(origin_dtype)
+
 
 class Emu3VQVAESpatialNorm(nn.Cell):
     def __init__(
@@ -541,10 +623,15 @@ class Emu3VQVAESpatialNorm(nn.Cell):
         )
 
     def construct(self, hidden_states: ms.Tensor, quant_states: ms.Tensor):
-        quant_states = mint.nn.functional.interpolate(quant_states, size=hidden_states.shape[-2:], mode="nearest")
+        quant_states = mint.nn.functional.interpolate(
+            quant_states, size=hidden_states.shape[-2:], mode="nearest"
+        )
         hidden_states = self.norm_layer(hidden_states)
-        hidden_states = hidden_states * self.conv_y(quant_states) + self.conv_b(quant_states)
+        hidden_states = hidden_states * self.conv_y(quant_states) + self.conv_b(
+            quant_states
+        )
         return hidden_states
+
 
 class Emu3VQVAETemporalUpsample(nn.Cell):
     def __init__(
@@ -562,9 +649,19 @@ class Emu3VQVAETemporalUpsample(nn.Cell):
 
     def construct(self, hidden_states: ms.Tensor):
         batch_size, channels, temporal, height, width = hidden_states.shape
-        hidden_states = hidden_states.permute(0, 1, 3, 4, 2).contiguous().view(batch_size, -1, temporal)  # (b, c, h, w, t) => (b, c*h*w, t)
-        hidden_states = mint.nn.functional.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
-        hidden_states = hidden_states.view(batch_size, channels, height, width, -1).permute(0, 1, 4, 2, 3).contiguous()
+        hidden_states = (
+            hidden_states.permute(0, 1, 3, 4, 2)
+            .contiguous()
+            .view(batch_size, -1, temporal)
+        )  # (b, c, h, w, t) => (b, c*h*w, t)
+        hidden_states = mint.nn.functional.interpolate(
+            hidden_states, scale_factor=2.0, mode="nearest"
+        )
+        hidden_states = (
+            hidden_states.view(batch_size, channels, height, width, -1)
+            .permute(0, 1, 4, 2, 3)
+            .contiguous()
+        )
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
@@ -587,12 +684,13 @@ class Emu3VQVAETemporalDownsample(nn.Cell):
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
+
 class Emu3VQVAETemporalResnetBlock(nn.Cell):
     def __init__(
         self,
         in_channels,
         out_channels=None,
-        conv3d_dtype=ms.float16,
+        conv3d_dtype=ms.bfloat16,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -615,11 +713,7 @@ class Emu3VQVAETemporalResnetBlock(nn.Cell):
         )
         if self.in_channels != self.out_channels:
             self.nin_shortcut = mint.nn.Conv3d(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0
+                in_channels, out_channels, kernel_size=1, stride=1, padding=0
             ).to_float(conv3d_dtype)
 
     def construct(self, hidden_states: ms.Tensor):
@@ -654,8 +748,12 @@ class Emu3VQVAEResnetBlock(nn.Cell):
         self.quant_channels = quant_channels
 
         if quant_channels is None:
-            self.norm1 = mint.nn.GroupNorm(num_channels=in_channels, num_groups=32, eps=1e-6, affine=True)
-            self.norm2 = mint.nn.GroupNorm(num_channels=out_channels, num_groups=32, eps=1e-6, affine=True)
+            self.norm1 = mint.nn.GroupNorm(
+                num_channels=in_channels, num_groups=32, eps=1e-6, affine=True
+            )
+            self.norm2 = mint.nn.GroupNorm(
+                num_channels=out_channels, num_groups=32, eps=1e-6, affine=True
+            )
         else:
             self.norm1 = Emu3VQVAESpatialNorm(quant_channels, in_channels)
             self.norm2 = Emu3VQVAESpatialNorm(quant_channels, out_channels)
@@ -685,7 +783,9 @@ class Emu3VQVAEResnetBlock(nn.Cell):
                 padding=0,
             )
 
-    def construct(self, hidden_states: ms.Tensor, quant_channels: Optional[ms.Tensor] = None):
+    def construct(
+        self, hidden_states: ms.Tensor, quant_channels: Optional[ms.Tensor] = None
+    ):
         norm_args = () if self.quant_channels is None else (quant_channels,)
 
         residual = hidden_states
@@ -705,6 +805,7 @@ class Emu3VQVAEResnetBlock(nn.Cell):
 
 class Emu3VQVAEAttentionBlock(nn.Cell):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -724,7 +825,8 @@ class Emu3VQVAEAttentionBlock(nn.Cell):
         self.q_proj = mint.nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = mint.nn.Linear(self.embed_dim, self.embed_dim)
 
-    def construct(self,
+    def construct(
+        self,
         hidden_states: ms.Tensor,
         attention_mask: Optional[ms.Tensor] = None,
         output_attentions: Optional[bool] = False,
@@ -736,9 +838,15 @@ class Emu3VQVAEAttentionBlock(nn.Cell):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view((batch_size, q_len, self.num_heads, self.head_dim)).swapaxes(1, 2)
-        key_states = key_states.view((batch_size, q_len, self.num_heads, self.head_dim)).swapaxes(1, 2)
-        value_states = value_states.view((batch_size, q_len, self.num_heads, self.head_dim)).swapaxes(1, 2)
+        query_states = query_states.view(
+            (batch_size, q_len, self.num_heads, self.head_dim)
+        ).swapaxes(1, 2)
+        key_states = key_states.view(
+            (batch_size, q_len, self.num_heads, self.head_dim)
+        ).swapaxes(1, 2)
+        value_states = value_states.view(
+            (batch_size, q_len, self.num_heads, self.head_dim)
+        ).swapaxes(1, 2)
 
         k_v_seq_len = key_states.shape[-2]
         attn_weights = mint.matmul(query_states, key_states.swapaxes(2, 3)) * self.scale
@@ -757,8 +865,12 @@ class Emu3VQVAEAttentionBlock(nn.Cell):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=ms.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=ms.float32).to(
+            query_states.dtype
+        )
+        attn_weights = nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
         attn_output = mint.matmul(attn_weights, value_states)
 
         if attn_output.size() != (batch_size, self.num_heads, q_len, self.head_dim):
@@ -786,7 +898,9 @@ class Emu3VQVAEGroupNorm(mint.nn.GroupNorm):
         super().__init__(**kwargs)
 
     def construct(self, input, quant_states=None):
-        return mint.nn.functional.group_norm(input, self.num_groups, self.weight, self.bias, self.eps)
+        return mint.nn.functional.group_norm(
+            input, self.num_groups, self.weight, self.bias, self.eps
+        )
 
 
 class Emu3VQVAEMiddleBlock(nn.Cell):
@@ -800,7 +914,9 @@ class Emu3VQVAEMiddleBlock(nn.Cell):
         )
         self.attn_1 = Emu3VQVAEAttentionBlock(config)
         if quant_channels is None:
-            self.attn_norm = Emu3VQVAEGroupNorm(num_channels=in_channels, num_groups=32, eps=1e-6, affine=True)
+            self.attn_norm = Emu3VQVAEGroupNorm(
+                num_channels=in_channels, num_groups=32, eps=1e-6, affine=True
+            )
         else:
             self.attn_norm = Emu3VQVAESpatialNorm(quant_channels, in_channels)
 
@@ -815,9 +931,13 @@ class Emu3VQVAEMiddleBlock(nn.Cell):
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states, quant_states)
         batch_size, channels, height, width = hidden_states.shape
-        hidden_states = hidden_states.view((batch_size, channels, height * width)).swapaxes(1, 2)
+        hidden_states = hidden_states.view(
+            (batch_size, channels, height * width)
+        ).swapaxes(1, 2)
         hidden_states = self.attn_1(hidden_states)[0]
-        hidden_states = hidden_states.reshape(batch_size, height, width, channels).permute((0, 3, 1, 2))
+        hidden_states = hidden_states.reshape(
+            batch_size, height, width, channels
+        ).permute((0, 3, 1, 2))
         hidden_states = residual + hidden_states
         hidden_states = self.block_2(hidden_states, quant_states)
         return hidden_states
@@ -849,9 +969,16 @@ class Emu3VQVAEDownBlock(nn.Cell):
                     )
                 )
                 block_in = block_out
-                if config.attn_resolutions is not None and i_level in config.attn_resolutions:
+                if (
+                    config.attn_resolutions is not None
+                    and i_level in config.attn_resolutions
+                ):
                     attn.append(Emu3VQVAEAttentionBlock(config))
-                    attn_norms.append(mint.nn.GroupNorm(num_channels=block_in, num_groups=32, eps=1e-6, affine=True))
+                    attn_norms.append(
+                        mint.nn.GroupNorm(
+                            num_channels=block_in, num_groups=32, eps=1e-6, affine=True
+                        )
+                    )
 
             down = nn.Cell()
             down.block = block
@@ -870,10 +997,14 @@ class Emu3VQVAEDownBlock(nn.Cell):
                     hidden_states = blocks.attn_norms[i_block](hidden_states)
 
                     batch_size, channels, height, width = hidden_states.shape
-                    hidden_states = hidden_states.view((batch_size, channels, height * width)).swapaxes(1, 2)
+                    hidden_states = hidden_states.view(
+                        (batch_size, channels, height * width)
+                    ).swapaxes(1, 2)
                     hidden_states = blocks.attn[i_block](hidden_states)[0]
 
-                    hidden_states = hidden_states.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
+                    hidden_states = hidden_states.reshape(
+                        batch_size, height, width, channels
+                    ).permute(0, 3, 1, 2)
                     hidden_states = residual + hidden_states
 
             if i_level != self.num_resolutions - 1:
@@ -926,13 +1057,19 @@ class Emu3VQVAEUpBlock(nn.Cell):
                 hidden_states = blocks.block[i_block](hidden_states, quant_states)
                 if len(blocks.attn) > 0:
                     residual = hidden_states
-                    hidden_states = blocks.attn_norms[i_block](hidden_states, quant_states)
+                    hidden_states = blocks.attn_norms[i_block](
+                        hidden_states, quant_states
+                    )
 
                     batch_size, channels, height, width = hidden_states.shape
-                    hidden_states = hidden_states.view((batch_size, channels, height * width)).swapaxes(1, 2)
+                    hidden_states = hidden_states.view(
+                        (batch_size, channels, height * width)
+                    ).swapaxes(1, 2)
                     hidden_states = blocks.attn[i_block](hidden_states)[0]
 
-                    hidden_states = hidden_states.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
+                    hidden_states = hidden_states.reshape(
+                        batch_size, height, width, channels
+                    ).permute(0, 3, 1, 2)
                     hidden_states = residual + hidden_states
             if i_level != len(self.up) - 1:
                 hidden_states = blocks.upsample(hidden_states)
@@ -951,11 +1088,15 @@ class Emu3VQVAEEncoder(nn.Cell):
         out_channels = 2 * latent_channels if double_latent else latent_channels
         block_in = base_channels * channel_multiplier[-1]
 
-        self.conv_in = mint.nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1)
-        self.down_block = Emu3VQVAEDownBlock(config) # downsample
-        self.middle_block = Emu3VQVAEMiddleBlock(config, block_in) # middle
+        self.conv_in = mint.nn.Conv2d(
+            in_channels, base_channels, kernel_size=3, stride=1, padding=1
+        )
+        self.down_block = Emu3VQVAEDownBlock(config)  # downsample
+        self.middle_block = Emu3VQVAEMiddleBlock(config, block_in)  # middle
 
-        self.norm_out = mint.nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True) # end
+        self.norm_out = mint.nn.GroupNorm(
+            num_groups=32, num_channels=block_in, eps=1e-6, affine=True
+        )  # end
 
         self.conv_out = mint.nn.Conv2d(
             block_in,
@@ -994,7 +1135,9 @@ class Emu3VQVAEEncoder(nn.Cell):
         hidden_states *= mint.sigmoid(hidden_states)
         hidden_states = self.conv_out(hidden_states)
 
-        hidden_states = hidden_states.reshape(-1, temporal_dim, *hidden_states.shape[1:])
+        hidden_states = hidden_states.reshape(
+            -1, temporal_dim, *hidden_states.shape[1:]
+        )
         hidden_states = hidden_states.permute(0, 2, 1, 3, 4)
 
         # temporal convs
@@ -1026,7 +1169,9 @@ class Emu3VQVAEDecoder(nn.Cell):
         temp_upsample_block_num = int(math.log2(config.temporal_downsample_factor))
         self.time_conv = nn.CellList()
         for i in range(temp_upsample_block_num):
-            conv = Emu3VQVAETemporalUpsample(config.latent_channels, config.latent_channels)
+            conv = Emu3VQVAETemporalUpsample(
+                config.latent_channels, config.latent_channels
+            )
             self.time_conv.append(conv)
 
         self.conv_in = mint.nn.Conv2d(
@@ -1037,7 +1182,9 @@ class Emu3VQVAEDecoder(nn.Cell):
             padding=1,
         )
 
-        self.middle_block = Emu3VQVAEMiddleBlock(config, block_in, quant_channels=quant_channels)
+        self.middle_block = Emu3VQVAEMiddleBlock(
+            config, block_in, quant_channels=quant_channels
+        )
         self.up_block = Emu3VQVAEUpBlock(config)
 
         block_in = config.base_channels * config.channel_multiplier[0]
@@ -1079,6 +1226,7 @@ class Emu3VQVAEDecoder(nn.Cell):
 
         return hidden_states
 
+
 EMU3_VQ_START_DOCSTRING = r"""
     This model inherits from [`MSPreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -1108,8 +1256,10 @@ def _calculate_fan_in_and_fan_out(arr):
     shape = arr.shape
     dimensions = len(shape)
     if dimensions < 2:
-        raise ValueError("'fan_in' and 'fan_out' can not be computed for arr with fewer than"
-                         " 2 dimensions, but got dimensions {}.".format(dimensions))
+        raise ValueError(
+            "'fan_in' and 'fan_out' can not be computed for arr with fewer than"
+            " 2 dimensions, but got dimensions {}.".format(dimensions)
+        )
     if dimensions == 2:  # Linear
         fan_in = shape[1]
         fan_out = shape[0]
@@ -1122,6 +1272,7 @@ def _calculate_fan_in_and_fan_out(arr):
         fan_in = num_input_fmaps * receptive_field_size
         fan_out = num_output_fmaps * receptive_field_size
     return fan_in, fan_out
+
 
 class Emu3VQVAE(MSPreTrainedModel):
     config_class = Emu3VQVAEConfig
@@ -1137,10 +1288,18 @@ class Emu3VQVAE(MSPreTrainedModel):
     def _init_weights(self, module):
         if isinstance(module, (mint.nn.Conv2d, mint.nn.Conv3d)):
             module.weight.set_data(
-                initializer(HeNormal(mode="fan_out", nonlinearity="relu"), module.weight.shape, module.weight.dtype)
+                initializer(
+                    HeNormal(mode="fan_out", nonlinearity="relu"),
+                    module.weight.shape,
+                    module.weight.dtype,
+                )
             )
         elif isinstance(module, mint.nn.Linear):
-            weight = initializer(HeNormal(negative_slope=math.sqrt(5)), module.weight.shape, module.weight.dtype)
+            weight = initializer(
+                HeNormal(negative_slope=math.sqrt(5)),
+                module.weight.shape,
+                module.weight.dtype,
+            )
             module.weight.set_data(weight)
             if module.bias is not None:
                 fan_in, _ = _calculate_fan_in_and_fan_out(module.weight)
@@ -1150,11 +1309,19 @@ class Emu3VQVAE(MSPreTrainedModel):
                 )
                 module.bias.set_data(bias_weight)
         elif isinstance(module, (mint.nn.BatchNorm2d, mint.nn.GroupNorm)):
-            module.weight.set_data(initializer(Constant(1), module.weight.shape, module.weight.dtype))
-            module.bias.set_data(initializer(Constant(0), module.bias.shape, module.bias.dtype))
+            module.weight.set_data(
+                initializer(Constant(1), module.weight.shape, module.weight.dtype)
+            )
+            module.bias.set_data(
+                initializer(Constant(0), module.bias.shape, module.bias.dtype)
+            )
         elif isinstance(module, mint.nn.BatchNorm3d):
-            module.weight.set_data(initializer(Constant(1), module.weight.shape, module.weight.dtype))
-            module.bias.set_data(initializer(Constant(0), module.bias.shape, module.bias.dtype))
+            module.weight.set_data(
+                initializer(Constant(1), module.weight.shape, module.weight.dtype)
+            )
+            module.bias.set_data(
+                initializer(Constant(0), module.bias.shape, module.bias.dtype)
+            )
 
     def __init__(self, config: Emu3VQVAEConfig):
         super().__init__(config)
@@ -1167,17 +1334,23 @@ class Emu3VQVAE(MSPreTrainedModel):
         self.vision_spatial_factor = 2 ** (len(config.channel_multiplier) - 1)
 
         self.quant_conv = Emu3VQVAEConv3d(
-            config.latent_channels, config.embed_dim, kernel_size=(3, 1, 1), stride=(1, 1, 1)
+            config.latent_channels,
+            config.embed_dim,
+            kernel_size=(3, 1, 1),
+            stride=(1, 1, 1),
         )
         self.post_quant_conv = Emu3VQVAEConv3d(
-            config.embed_dim, config.latent_channels, kernel_size=(3, 1, 1), stride=(1, 1, 1)
+            config.embed_dim,
+            config.latent_channels,
+            kernel_size=(3, 1, 1),
+            stride=(1, 1, 1),
         )
         self.spatial_scale_factor = 2 ** (len(config.channel_multiplier) - 1)
         self.set_train(False)  # Emu3's VQ model is frozen
 
         self.post_init()
 
-    def encode(self,pixel_values: ms.Tensor, image_sizes: ms.Tensor):
+    def encode(self, pixel_values: ms.Tensor, image_sizes: ms.Tensor):
         is_image = pixel_values.ndim == 4
         if is_image:
             temporal = self.config.temporal_downsample_factor
@@ -1199,7 +1372,10 @@ class Emu3VQVAE(MSPreTrainedModel):
         image_tokens = codes.squeeze(1) if is_image else codes
 
         image_tokens = [
-            single_image[: int(size[0] / self.vision_spatial_factor), : int(size[1] / self.vision_spatial_factor)]
+            single_image[
+                : int(size[0] / self.vision_spatial_factor),
+                : int(size[1] / self.vision_spatial_factor),
+            ]
             for single_image, size in zip(image_tokens, image_sizes)
         ]
 
@@ -1214,7 +1390,11 @@ class Emu3VQVAE(MSPreTrainedModel):
         quant = self.quantize.embedding(hidden_states.flatten(start_dim=0))
 
         channels = quant.shape[-1]
-        quant = quant.view((batch_size, temporal, height, width, channels)).permute(0, 4, 1, 2, 3).contiguous()
+        quant = (
+            quant.view((batch_size, temporal, height, width, channels))
+            .permute(0, 4, 1, 2, 3)
+            .contiguous()
+        )
         post_quant = self.post_quant_conv(quant)
 
         quant = quant.permute(0, 2, 1, 3, 4)
@@ -1243,15 +1423,29 @@ class Emu3ImageVocabularyMapping:
 
     @cached_property
     def image_tokens(self):
-        return sorted([val for name, val in self.vocab_map.items() if name.startswith("<|visual token")])
+        return sorted(
+            [
+                val
+                for name, val in self.vocab_map.items()
+                if name.startswith("<|visual token")
+            ]
+        )
 
     @cached_property
     def image_tokens_str(self):
-        return sorted([name for name, val in self.vocab_map.items() if name.startswith("<|visual token")])
+        return sorted(
+            [
+                name
+                for name, val in self.vocab_map.items()
+                if name.startswith("<|visual token")
+            ]
+        )
 
     @cached_property
     def img2bpe(self):
-        return {int(token[-8:-2]): self.vocab_map[token] for token in self.image_tokens_str}
+        return {
+            int(token[-8:-2]): self.vocab_map[token] for token in self.image_tokens_str
+        }
 
     @cached_property
     def bpe2img(self):
@@ -1281,6 +1475,7 @@ class Emu3ImageVocabularyMapping:
         img_batch = img_batch[..., :-1]  # remove last row of EOL tokens
         img_tokens = self.bpe2img_mapping_tensor[img_batch]
         return img_tokens
+
 
 EMU3_START_DOCSTRING = r"""
     This model inherits from [`MSPreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -1314,7 +1509,9 @@ class Emu3PreTrainedModel(MSPreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = False
     _supports_quantized_cache = True
-    _supports_cache_class = True  # support Cache Classes; True: use DynamicCache by default
+    _supports_cache_class = (
+        True  # support Cache Classes; True: use DynamicCache by default
+    )
     _supports_static_cache = False
     _supports_param_buffer_assignment = False
     _supports_flex_attn = False
@@ -1322,23 +1519,38 @@ class Emu3PreTrainedModel(MSPreTrainedModel):
     def _init_weights(self, module):
         std = self.config.get_text_config().initializer_range
         if isinstance(module, mint.nn.Linear):
-            module.weight.set_data(initializer(Normal(sigma=std, mean=0.0), module.weight.shape, module.weight.dtype))
+            module.weight.set_data(
+                initializer(
+                    Normal(sigma=std, mean=0.0),
+                    module.weight.shape,
+                    module.weight.dtype,
+                )
+            )
             if module.bias is not None:
-                module.bias.set_data(initializer("zeros", module.bias.shape, module.bias.dtype))
+                module.bias.set_data(
+                    initializer("zeros", module.bias.shape, module.bias.dtype)
+                )
         elif isinstance(module, mint.nn.Embedding):
             module.weight.set_data(
-                initializer(Normal(sigma=std, mean=0.0), module.weight.shape, module.weight.dtype)
+                initializer(
+                    Normal(sigma=std, mean=0.0),
+                    module.weight.shape,
+                    module.weight.dtype,
+                )
             )
             if module.padding_idx is not None:
                 module.weight[module.padding_idx] = 0
+
 
 class Emu3RotaryEmbedding(nn.Cell):
     def __init__(self, config: Emu3Config):
         super().__init__()
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
-            self.rope_type = "default" # currenly only support "default"
+            self.rope_type = "default"  # currenly only support "default"
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
@@ -1355,23 +1567,34 @@ class Emu3RotaryEmbedding(nn.Cell):
         """
         seq_len = mint.max(position_ids) + 1
         if seq_len > self.max_seq_len_cached:  # growth
-            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, seq_len=seq_len)
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, seq_len=seq_len
+            )
             self.max_seq_len_cached = seq_len
 
-        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+        if (
+            seq_len < self.original_max_seq_len
+            and self.max_seq_len_cached > self.original_max_seq_len
+        ):  # reset
             self.inv_freq = self.original_inv_freq
             self.max_seq_len_cached = self.original_max_seq_len
 
     def construct(self, x, position_ids):
         with no_grad():
-            if "dynamic" in self.rope_type: # not used
+            if "dynamic" in self.rope_type:  # not used
                 self._dynamic_frequency_update(position_ids)
 
             # Core RoPE block
-            inv_freq_expanded = self.inv_freq[None, :, None].float().broadcast_to((position_ids.shape[0], -1, 1))
+            inv_freq_expanded = (
+                self.inv_freq[None, :, None]
+                .float()
+                .broadcast_to((position_ids.shape[0], -1, 1))
+            )
             position_ids_expanded = position_ids[:, None, :].float()
             # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).swapaxes(1, 2)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).swapaxes(1, 2)
             emb = mint.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
@@ -1473,11 +1696,15 @@ class Emu3TextModel(Emu3PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = mint.nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
-        self.layers = nn.CellList(
-            [Emu3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        self.embed_tokens = mint.nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=self.padding_idx
         )
-        self._use_sdpa = config._attn_implementation == "sdpa"
+        self.layers = nn.CellList(
+            [
+                Emu3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = Emu3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Emu3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -1540,17 +1767,27 @@ class Emu3TextModel(Emu3PreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[ms.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
@@ -1563,7 +1800,6 @@ class Emu3TextModel(Emu3PreTrainedModel):
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             use_cache = False
-
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1578,13 +1814,21 @@ class Emu3TextModel(Emu3PreTrainedModel):
                     past_seen_tokens = past_key_values.get_seq_length()
                 else:  # tuple static cache
                     past_seen_tokens = get_seq_length(past_key_values)
-            cache_position = ops.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], dtype=ms.int32)
+            cache_position = ops.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                dtype=ms.int32,
+            )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
         causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            attention_mask,
+            inputs_embeds,
+            cache_position,
+            past_key_values,
+            output_attentions,
         )
 
         # embed positions
@@ -1668,11 +1912,9 @@ class Emu3TextModel(Emu3PreTrainedModel):
             attention_mask,
             sequence_length=sequence_length,
             target_length=target_length,
-            dtype=ms.float16,
             cache_position=cache_position,
             batch_size=input_tensor.shape[0],
         )
-
 
         return causal_mask
 
@@ -1681,10 +1923,8 @@ class Emu3TextModel(Emu3PreTrainedModel):
         attention_mask: ms.Tensor,
         sequence_length: int,
         target_length: int,
-        dtype: ms.dtype,
         cache_position: ms.Tensor,
         batch_size: int,
-        **kwargs,
     ):
         """
         Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
@@ -1699,8 +1939,6 @@ class Emu3TextModel(Emu3PreTrainedModel):
             target_length (`int`):
                 The target length: when generating with static cache, the mask should be as long as the static cache,
                 to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`ms.dtype`):
-                The dtype to use for the 4D attention mask.
             cache_position (`ms.Tensor`):
                 Indices depicting the position of the input sequence tokens in the sequence.
             batch_size (`ms.Tensor`):
@@ -1710,23 +1948,29 @@ class Emu3TextModel(Emu3PreTrainedModel):
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
-            min_dtype = dtype_to_min(dtype)
-            causal_mask = ops.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype)
+            min_dtype = _MIN_FP16
+            causal_mask = ops.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=ms.float16
+            )
             if sequence_length != 1:
                 causal_mask = mint.triu(causal_mask, diagonal=1)
             causal_mask *= ops.arange(target_length) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].broadcast_to((batch_size, 1, -1, -1))
+            causal_mask = causal_mask[None, None, :, :].broadcast_to(
+                (batch_size, 1, -1, -1)
+            )
             if attention_mask is not None:
-                causal_mask = causal_mask[:]
+                causal_mask = causal_mask.clone() # copy to contiguous memory for in-place edit
                 mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = (
+                    causal_mask[:, :, :, :mask_length]
+                    + attention_mask[:, None, None, :]
+                )
                 padding_mask = padding_mask == 0
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                     padding_mask, min_dtype
                 )
 
         return causal_mask
-
 
 
 class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
@@ -1762,7 +2006,9 @@ class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
         return self.model
 
     @add_start_docstrings_to_model_forward(EMU3_TEXT_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class="Emu3TextConfig")
+    @replace_return_docstrings(
+        output_type=CausalLMOutputWithPast, config_class="Emu3TextConfig"
+    )
     def construct(
         self,
         input_ids: ms.Tensor = None,
@@ -1823,9 +2069,13 @@ class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
         # Only compute necessary logits if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        logits = logits.float() # some logits processor not support bf16
+        logits = logits.float()  # some logits processor not support bf16
 
         loss = None
         if labels is not None:  # training pipeline
@@ -1849,105 +2099,11 @@ class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-    '''
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        **kwargs
-    ):
-        # 1. Handle BC:
-        model_inputs = {}
-        # - some models don't have `Cache` support (which implies they don't expect `cache_position` in `forward`)
-        # - `cache_position` was not a mandatory input in `prepare_inputs_for_generation` for those models, and this
-        #   function may be called outside of `generate`. Handle most use cases by creating `cache_position` on the fly
-        #   (this alternative is not as robust as calling `generate` and letting it create `cache_position`)
-        if cache_position is None: # TODO: need double check for tuple cache
-            past_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-            cache_position = ops.arange(past_length, input_ids.shape[1], dtype=ms.int32)
 
-        # 2. Generic cache-dependent input preparation
-        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
-        # Exception 1: when passing input_embeds, input_ids may be missing entries
-        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
-        # Exception 3: with synced GPUs cache_position may go out of bounds, but we only want dummy token in that case.
-        # Excpetion 4: If input_embeds are passed then slice it through `cache_position`, to keep only the unprocessed tokens and
-        # generate the first token for each sequence. Later use the generated Input ids for continuation.
-        if past_key_values is not None and isinstance(past_key_values, Cache):
-            if inputs_embeds is not None and input_ids.shape[1] == 0:  # Exception 4
-                inputs_embeds = inputs_embeds[:, -cache_position.shape[0] :]
-            elif inputs_embeds is not None or (cache_position[-1] >= input_ids.shape[1]):  # Exception 1  # Exception 3
-                input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
-                input_ids = input_ids[:, cache_position]
-
-        # if past_key_values is not None:
-        #     if isinstance(past_key_values, Cache):
-        #         cache_length = past_key_values.get_seq_length()
-        #         past_length = past_key_values.seen_tokens
-        #         max_cache_length = past_key_values.get_max_length()
-        #     else:
-        #         cache_length = past_length = past_key_values[0][0].shape[2]
-        #         max_cache_length = None
-
-        #     # Keep only the unprocessed tokens:
-        #     # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-        #     # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
-        #     # input)
-        #     if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-        #         input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-        #     # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-        #     # input_ids based on the past_length.
-        #     elif past_length < input_ids.shape[1]:
-        #         input_ids = input_ids[:, past_length:]
-        #     # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-        #     # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
-        #     if (
-        #         max_cache_length is not None
-        #         and attention_mask is not None
-        #         and cache_length + input_ids.shape[1] > max_cache_length
-        #     ):
-        #         attention_mask = attention_mask[:, -max_cache_length:]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.int().cumsum(-1) - 1  # cumsum support int32/int8/uint8 not support int64
-            position_ids.masked_fill(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-            }
-        )
-        return model_inputs
-    '''
-
-    @staticmethod
-    def _reorder_cache(past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
-        return reordered_past
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
 
 EMU3_INPUTS_DOCSTRING = r"""
     Args:
@@ -2027,6 +2183,7 @@ EMU3_INPUTS_DOCSTRING = r"""
             the complete sequence length.
 """
 
+
 class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["text_model.lm_head.weight"]
     _supports_static_cache = False  # `get_image_tokens()`, called when `pixel_values` is passed, is not compileable
@@ -2059,7 +2216,10 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
                 The sizes of the images in the batch, being (height, width) for each image.
         """
         image_tokens_list = self.vqmodel.encode(pixel_values, image_sizes)
-        bpe_tokens_list = [self.vocabulary_mapping.convert_img2bpe(tokens).flatten() for tokens in image_tokens_list]
+        bpe_tokens_list = [
+            self.vocabulary_mapping.convert_img2bpe(tokens).flatten()
+            for tokens in image_tokens_list
+        ]
         bpe_tokens = mint.cat(bpe_tokens_list)
         return bpe_tokens
 
@@ -2083,7 +2243,9 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
             return image
 
     @add_start_docstrings_to_model_forward(EMU3_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(
+        output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
+    )
     def construct(
         self,
         input_ids: ms.Tensor = None,
@@ -2159,7 +2321,7 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if (input_ids is not None) and (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
@@ -2216,10 +2378,16 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
         )
 
-        if cache_position[0] != 0:
+        if (cache_position is not None) and cache_position[0] != 0:
             model_inputs["pixel_values"] = None
 
         return model_inputs
 
 
-__all__ = ["Emu3ForConditionalGeneration", "Emu3ForCausalLM", "Emu3TextModel", "Emu3PreTrainedModel", "Emu3VQVAE"]
+__all__ = [
+    "Emu3ForConditionalGeneration",
+    "Emu3ForCausalLM",
+    "Emu3TextModel",
+    "Emu3PreTrainedModel",
+    "Emu3VQVAE",
+]
