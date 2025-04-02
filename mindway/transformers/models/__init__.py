@@ -15,6 +15,7 @@ from . import (
     llava,
     phi3,
     qwen2_5_vl,
+    qwen2_audio,
     qwen2_vl,
     speecht5,
     t5,
