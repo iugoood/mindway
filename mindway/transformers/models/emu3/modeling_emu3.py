@@ -512,7 +512,7 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
         hidden_state = hidden_state.permute(
             0, 1, 3, 4, 2
         ).contiguous()  # (b, t, h, w, c)
-        hidden_state_flattened = hidden_state.view(-1, channels)
+        hidden_state_flattened = hidden_state.view((-1, channels))
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         hidden_state_sum = ops.sum(hidden_state_flattened**2, dim=1, keepdim=True)
@@ -526,7 +526,7 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
 
         min_encoding_indices = ops.argmin(distances, axis=1)
         min_encoding_indices = min_encoding_indices.view(
-            batch_size, temporal, height, width
+            (batch_size, temporal, height, width)
         )
         return min_encoding_indices
 
@@ -652,13 +652,13 @@ class Emu3VQVAETemporalUpsample(nn.Cell):
         hidden_states = (
             hidden_states.permute(0, 1, 3, 4, 2)
             .contiguous()
-            .view(batch_size, -1, temporal)
+            .view((batch_size, -1, temporal))
         )  # (b, c, h, w, t) => (b, c*h*w, t)
         hidden_states = mint.nn.functional.interpolate(
             hidden_states, scale_factor=2.0, mode="nearest"
         )
         hidden_states = (
-            hidden_states.view(batch_size, channels, height, width, -1)
+            hidden_states.view((batch_size, channels, height, width, -1))
             .permute(0, 1, 4, 2, 3)
             .contiguous()
         )
@@ -798,7 +798,7 @@ class Emu3VQVAEResnetBlock(nn.Cell):
         hidden_states = self.conv2(hidden_states)
 
         if self.in_channels != self.out_channels:
-            residual = self.conv_shortcut(residual)
+            residual = self.nin_shortcut(residual)
 
         return residual + hidden_states
 
@@ -860,26 +860,26 @@ class Emu3VQVAEAttentionBlock(nn.Cell):
         if attention_mask is not None:
             if attention_mask.shape != (batch_size, 1, q_len, k_v_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size {(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.shape}"
                 )
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=ms.float32).to(
+        attn_weights = mint.nn.functional.softmax(attn_weights, dim=-1, dtype=ms.float32).to(
             query_states.dtype
         )
-        attn_weights = nn.functional.dropout(
+        attn_weights = mint.nn.functional.dropout(
             attn_weights, p=self.dropout, training=self.training
         )
         attn_output = mint.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (batch_size, self.num_heads, q_len, self.head_dim):
+        if attn_output.shape != (batch_size, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(batch_size, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+                f" {attn_output.shape}"
             )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.swapaxes(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, q_len, self.embed_dim)
 
         attn_output = self.out_proj(attn_output)
@@ -1305,7 +1305,7 @@ class Emu3VQVAE(MSPreTrainedModel):
                 fan_in, _ = _calculate_fan_in_and_fan_out(module.weight)
                 bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
                 bias_weight = initializer(
-                    Uniform(scale=bound), module.weight.shape, module.weight.dtype
+                    Uniform(scale=bound), module.bias.shape, module.bias.dtype
                 )
                 module.bias.set_data(bias_weight)
         elif isinstance(module, (mint.nn.BatchNorm2d, mint.nn.GroupNorm)):
@@ -1944,7 +1944,7 @@ class Emu3TextModel(Emu3PreTrainedModel):
             batch_size (`ms.Tensor`):
                 Batch size.
         """
-        if attention_mask is not None and attention_mask.dim() == 4:
+        if attention_mask is not None and attention_mask.ndim == 4:
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
@@ -2083,8 +2083,8 @@ class Emu3ForCausalLM(Emu3PreTrainedModel, GenerationMixin):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
+            shift_logits = shift_logits.view((-1, self.config.vocab_size))
+            shift_labels = shift_labels.view((-1))
             loss = self.loss_func(shift_logits, shift_labels)
             return loss
 
@@ -2217,7 +2217,7 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
         """
         image_tokens_list = self.vqmodel.encode(pixel_values, image_sizes)
         bpe_tokens_list = [
-            self.vocabulary_mapping.convert_img2bpe(tokens).flatten()
+            self.vocabulary_mapping.convert_img2bpe(tokens).flatten(start_dim=0)
             for tokens in image_tokens_list
         ]
         bpe_tokens = mint.cat(bpe_tokens_list)
@@ -2237,9 +2237,9 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
                 Width of the generated image before upsampling.
         """
         with no_grad():
-            sequences = image_tokens[:, :-3].view(-1, height, width + 1)
-            image_tokens = self.vocabulary_mapping.convert_bpe2img(sequences)
-            image = self.vqmodel.decode(image_tokens)
+            sequences = image_tokens[:, :-3].view((-1, height, width + 1))
+            image_tokens = ops.stop_gradient(self.vocabulary_mapping.convert_bpe2img(sequences))
+            image = ops.stop_gradient(self.vqmodel.decode(image_tokens))
             return image
 
     @add_start_docstrings_to_model_forward(EMU3_INPUTS_DOCSTRING)
@@ -2364,6 +2364,7 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
         position_ids=None,
         use_cache=True,
         pixel_values=None,
+        **kwargs
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
 

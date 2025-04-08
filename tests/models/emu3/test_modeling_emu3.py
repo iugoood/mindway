@@ -154,8 +154,17 @@ EMU3_CASES = [
             "last_hidden_state": "last_hidden_state",
         },
     ],
+    [
+        "Emu3VQVAEEncoder",
+        "transformers.models.emu3.modeling_emu3.Emu3VQVAEEncoder",
+        "mindway.transformers.models.emu3.modeling_emu3.Emu3VQVAEEncoder",
+        (vq_config,),
+        {},
+        (),
+        {"pixel_values": pixel_values},
+        {},
+    ],
 ]
-
 
 @pytest.mark.parametrize(
     "name,pt_module,ms_module,init_args,init_kwargs,inputs_args,inputs_kwargs,outputs_map,dtype,mode",
