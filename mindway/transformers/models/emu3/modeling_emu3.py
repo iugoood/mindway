@@ -520,7 +520,7 @@ class Emu3VQVAEVectorQuantizer(nn.Cell):
 
         # "bd,dn->bn"
         distances = 2 * ops.matmul(
-            hidden_state_flattened, self.embedding.weight.permute(0, 1)
+            hidden_state_flattened, self.embedding.weight.swapaxes(0, 1)
         )
         distances = hidden_state_sum + embedding_sum - distances
 
@@ -606,7 +606,7 @@ class Emu3VQVAESpatialNorm(nn.Cell):
             num_groups=32,
             eps=1e-6,
             affine=True,
-        )
+        ).to_float(ms.float32)
         self.conv_y = mint.nn.Conv2d(
             in_channels,
             out_channels,
@@ -623,10 +623,11 @@ class Emu3VQVAESpatialNorm(nn.Cell):
         )
 
     def construct(self, hidden_states: ms.Tensor, quant_states: ms.Tensor):
+        origin_dtype = hidden_states.dtype
         quant_states = mint.nn.functional.interpolate(
             quant_states, size=hidden_states.shape[-2:], mode="nearest"
         )
-        hidden_states = self.norm_layer(hidden_states)
+        hidden_states = self.norm_layer(hidden_states).to(origin_dtype)
         hidden_states = hidden_states * self.conv_y(quant_states) + self.conv_b(
             quant_states
         )
@@ -697,14 +698,14 @@ class Emu3VQVAETemporalResnetBlock(nn.Cell):
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
 
-        self.norm1 = mint.nn.BatchNorm3d(in_channels)
+        self.norm1 = mint.nn.BatchNorm3d(in_channels).to_float(ms.float32)
         self.conv1 = Emu3VQVAEConv3d(
             in_channels,
             out_channels,
             kernel_size=(3, 3, 3),
             stride=(1, 1, 1),
         )
-        self.norm2 = mint.nn.BatchNorm3d(out_channels)
+        self.norm2 = mint.nn.BatchNorm3d(out_channels).to_float(ms.float32)
         self.conv2 = Emu3VQVAEConv3d(
             out_channels,
             out_channels,
@@ -719,11 +720,11 @@ class Emu3VQVAETemporalResnetBlock(nn.Cell):
     def construct(self, hidden_states: ms.Tensor):
         origin_dtype = hidden_states.dtype
         residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.norm1(hidden_states).to(origin_dtype)
         hidden_states *= mint.sigmoid(hidden_states)
         hidden_states = self.conv1(hidden_states)
 
-        hidden_states = self.norm2(hidden_states)
+        hidden_states = self.norm2(hidden_states).to(origin_dtype)
         hidden_states *= mint.sigmoid(hidden_states)
         hidden_states = self.conv2(hidden_states)
 
@@ -750,10 +751,10 @@ class Emu3VQVAEResnetBlock(nn.Cell):
         if quant_channels is None:
             self.norm1 = mint.nn.GroupNorm(
                 num_channels=in_channels, num_groups=32, eps=1e-6, affine=True
-            )
+            ).to_float(ms.float32)
             self.norm2 = mint.nn.GroupNorm(
                 num_channels=out_channels, num_groups=32, eps=1e-6, affine=True
-            )
+            ).to_float(ms.float32)
         else:
             self.norm1 = Emu3VQVAESpatialNorm(quant_channels, in_channels)
             self.norm2 = Emu3VQVAESpatialNorm(quant_channels, out_channels)
@@ -786,14 +787,15 @@ class Emu3VQVAEResnetBlock(nn.Cell):
     def construct(
         self, hidden_states: ms.Tensor, quant_channels: Optional[ms.Tensor] = None
     ):
+        origin_dtype = hidden_states.dtype
         norm_args = () if self.quant_channels is None else (quant_channels,)
 
         residual = hidden_states
-        hidden_states = self.norm1(hidden_states, *norm_args)
+        hidden_states = self.norm1(hidden_states, *norm_args).to(origin_dtype)
         hidden_states *= mint.sigmoid(hidden_states)
         hidden_states = self.conv1(hidden_states)
 
-        hidden_states = self.norm2(hidden_states, *norm_args)
+        hidden_states = self.norm2(hidden_states, *norm_args).to(origin_dtype)
         hidden_states *= mint.sigmoid(hidden_states)
         hidden_states = self.conv2(hidden_states)
 
@@ -898,9 +900,10 @@ class Emu3VQVAEGroupNorm(mint.nn.GroupNorm):
         super().__init__(**kwargs)
 
     def construct(self, input, quant_states=None):
+        origin_dtype = input.dtype
         return mint.nn.functional.group_norm(
-            input, self.num_groups, self.weight, self.bias, self.eps
-        )
+            input.float(), self.num_groups, self.weight, self.bias, self.eps
+        ).to(origin_dtype)
 
 
 class Emu3VQVAEMiddleBlock(nn.Cell):
@@ -977,7 +980,7 @@ class Emu3VQVAEDownBlock(nn.Cell):
                     attn_norms.append(
                         mint.nn.GroupNorm(
                             num_channels=block_in, num_groups=32, eps=1e-6, affine=True
-                        )
+                        ).to_float(ms.float32)
                     )
 
             down = nn.Cell()
@@ -989,12 +992,13 @@ class Emu3VQVAEDownBlock(nn.Cell):
             self.down.append(down)
 
     def construct(self, hidden_states: ms.Tensor):
+        origin_dtype = hidden_states.dtype
         for i_level, blocks in enumerate(self.down):
             for i_block in range(self.num_res_blocks):
                 hidden_states = blocks.block[i_block](hidden_states)
                 if len(blocks.attn) > 0:
                     residual = hidden_states
-                    hidden_states = blocks.attn_norms[i_block](hidden_states)
+                    hidden_states = blocks.attn_norms[i_block](hidden_states).to(origin_dtype)
 
                     batch_size, channels, height, width = hidden_states.shape
                     hidden_states = hidden_states.view(
@@ -1096,7 +1100,7 @@ class Emu3VQVAEEncoder(nn.Cell):
 
         self.norm_out = mint.nn.GroupNorm(
             num_groups=32, num_channels=block_in, eps=1e-6, affine=True
-        )  # end
+        ).to_float(ms.float32)  # end
 
         self.conv_out = mint.nn.Conv2d(
             block_in,
@@ -1122,6 +1126,8 @@ class Emu3VQVAEEncoder(nn.Cell):
             self.time_res_stack.append(time_res_conv)
 
     def construct(self, pixel_values: ms.Tensor):
+        origin_dtype = pixel_values.dtype
+
         temporal_dim = pixel_values.shape[1]
         pixel_values = pixel_values.reshape(-1, *pixel_values.shape[2:])
 
@@ -1131,7 +1137,7 @@ class Emu3VQVAEEncoder(nn.Cell):
         hidden_states = self.middle_block(hidden_states)
 
         # end
-        hidden_states = self.norm_out(hidden_states)
+        hidden_states = self.norm_out(hidden_states).to(origin_dtype)
         hidden_states *= mint.sigmoid(hidden_states)
         hidden_states = self.conv_out(hidden_states)
 
@@ -2334,7 +2340,7 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
         if pixel_values is not None:
             image_tokens = self.get_image_tokens(pixel_values, image_sizes)
             special_image_mask = input_ids == self.vocabulary_mapping.image_token_id
-            image_tokens = image_tokens.to(input_ids.device, input_ids.dtype)
+            image_tokens = image_tokens.to(input_ids.dtype)
             input_ids = input_ids.masked_scatter(special_image_mask, image_tokens)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
@@ -2377,6 +2383,7 @@ class Emu3ForConditionalGeneration(Emu3PreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             pixel_values=pixel_values,
             use_cache=use_cache,
+            **kwargs
         )
 
         if (cache_position is not None) and cache_position[0] != 0:
