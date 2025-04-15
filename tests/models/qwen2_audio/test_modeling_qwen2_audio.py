@@ -86,7 +86,7 @@ class Qwen2AudioTester:
         self.attn_implementation = attn_implementation
 
     def get_large_model_config(self):
-        return Emu3TextConfig.from_pretrained("BAAI/Emu3-Chat-hf")
+        return Qwen2AudioConfig.from_pretrained("BAAI/Emu3-Chat-hf")
 
     def prepare_config_and_inputs(self):
         input_ids = ids_numpy(

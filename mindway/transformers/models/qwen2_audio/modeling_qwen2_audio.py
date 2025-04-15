@@ -37,6 +37,7 @@ from ...utils import (
 from ...utils.deprecation import deprecate_kwarg
 from ..auto import AutoModel, AutoModelForCausalLM
 from ...mindspore_adapter import scaled_dot_product_attention, dtype_to_max
+from ...modeling_attn_mask_utils import _MIN_FP16
 from transformers import Qwen2AudioConfig, Qwen2AudioEncoderConfig
 
 from ...utils import is_flash_attn_2_available
@@ -317,6 +318,8 @@ class Qwen2AudioSdpaAttention(Qwen2AudioAttention):
             key_states,
             value_states,
             attn_mask=causal_mask,
+            # dropout_p=self.dropout if self.training else 0.0,
+            # is_causal=is_causal,
         )
 
         if attn_output.shape != (bsz, self.num_heads, tgt_len, self.head_dim):
@@ -448,10 +451,10 @@ class Qwen2AudioPreTrainedModel(MSPreTrainedModel):
         std = self.config.init_std if hasattr(self.config, "init_std") else self.config.audio_config.init_std
 
         if isinstance(module, (mint.nn.Linear, nn.Conv1d)):
-            weight = Initializer(Normal(sigma=std, mean=0.0), shape=module.weight.shape)
+            weight = initializer(Normal(sigma=std, mean=0.0), shape=module.weight.shape)
             module.weight.set_data(weight)
             if module.bias is not None:
-                bias_weight = Initializer("zeros", module.bias.shape)
+                bias_weight = initializer("zeros", module.bias.shape)
                 module.bias.set_data(bias_weight)
         elif isinstance(module, mint.nn.Embedding):
             module.weight.set_data(
@@ -745,14 +748,13 @@ QWEN2AUDIO_INPUTS_DOCSTRING = r"""
 class Qwen2AudioForConditionalGeneration(Qwen2AudioPreTrainedModel, GenerationMixin):
     def __init__(self, config: Qwen2AudioConfig):
         super().__init__(config)
-        self.audio_tower = AutoModel.from_config(config.audio_config)  # Usually a `Qwen2AudioEncoder` instance
-        assert isinstance(self.audio_tower, Qwen2AudioEncoder)
+        # self.audio_tower = AutoModel.from_config(config.audio_config)  # Usually a `Qwen2AudioEncoder` instance
+        self.audio_tower = Qwen2AudioEncoder(config.audio_config)  # Usually a `Qwen2AudioEncoder` instance
 
         self.multi_modal_projector = Qwen2AudioMultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
-        self.language_model = AutoModelForCausalLM.from_config(config.text_config) # e.g. Qwen2Model` instance
-        print("self.language_model", self.language_model)
-        # assert isinstance(self.language_model, Qwen)
+        # self.language_model = AutoModelForCausalLM.from_config(config.text_config) # e.g. Qwen2Model` instance
+        self.language_model = Qwen2Model(config.text_config) # e.g. Qwen2Model` instance
         if self.language_model._tied_weights_keys is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
 
